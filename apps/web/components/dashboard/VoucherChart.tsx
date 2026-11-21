@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import {
   AreaChart,
   Area,
@@ -39,8 +39,21 @@ interface VoucherChartProps {
 export function VoucherChart({ network }: VoucherChartProps) {
   const [data, setData] = useState<ChartPoint[]>([])
   const [loadFailed, setLoadFailed] = useState(false)
+  // Track the network for which data was last set to prevent reversed completion
+  // order (e.g., a slow testnet response replacing fast mainnet data).
+  const networkRef = useRef<'testnet' | 'mainnet'>(network)
+  const abortControllerRef = useRef<AbortController | null>(null)
 
   const fetchData = useCallback(async () => {
+    // Cancel any in-flight query before starting a new one. This prevents
+    // delayed responses from a previous network from overwriting the current
+    // network's data. (#112)
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+    }
+    abortControllerRef.current = new AbortController()
+    const signal = abortControllerRef.current.signal
+
     const supabase = getSupabaseBrowserClient()
     const { data: rows, error } = await supabase
       .from('public_sessions')
@@ -55,6 +68,12 @@ export function VoucherChart({ network }: VoucherChartProps) {
       .eq('network', network)
       .order('updated_at', { ascending: false })
       .limit(500)
+
+    // Abort if the component was unmounted, network changed, or a new fetch was
+    // started. Do not update state for out-of-date responses.
+    if (signal.aborted || networkRef.current !== network) {
+      return
+    }
 
     if (error) {
       // Keep whatever is already on screen: a single failed poll must not wipe a
@@ -91,11 +110,19 @@ export function VoucherChart({ network }: VoucherChartProps) {
   }, [network])
 
   useEffect(() => {
+    networkRef.current = network
+  }, [network])
+
+  useEffect(() => {
     const initialFetch = setTimeout(() => void fetchData(), 0)
     const interval = setInterval(() => void fetchData(), 30_000)
     return () => {
       clearTimeout(initialFetch)
       clearInterval(interval)
+      // Cancel any in-flight request when the component unmounts.
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort()
+      }
     }
   }, [fetchData])
 

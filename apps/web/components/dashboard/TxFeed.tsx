@@ -34,9 +34,13 @@ export function TxFeed({ initialEntries = [] }: TxFeedProps) {
   const [paused, setPaused] = useState(false)
   const [loadingMore, setLoadingMore] = useState(false)
   const [hasMore, setHasMore] = useState(initialEntries.length >= PAGE_SIZE)
-  const cursorRef = useRef<string | null>(
+  const configured = isSupabaseConfigured()
+  const cursorRef = useRef<{ created_at: string; id: string } | null>(
     initialEntries.length > 0
-      ? initialEntries[initialEntries.length - 1].created_at
+      ? {
+          created_at: initialEntries[initialEntries.length - 1].created_at,
+          id: initialEntries[initialEntries.length - 1].id,
+        }
       : null,
   )
 
@@ -129,18 +133,27 @@ export function TxFeed({ initialEntries = [] }: TxFeedProps) {
   }, [configured])
 
   // Cursor-based pagination: fetch the next batch strictly older than the
-  // oldest row currently shown, using the indexed created_at column.
+  // oldest row currently shown, using a composite cursor of (created_at, id)
+  // to ensure deterministic ordering even when multiple rows share the same
+  // timestamp. Without an id tie-breaker, some rows could be skipped if they
+  // have identical created_at values. (#3)
   async function loadMore() {
     const cursor = cursorRef.current
     if (loadingMore || !hasMore || cursor === null) return
 
     setLoadingMore(true)
     const supabase = getSupabaseBrowserClient()
+    // Fetch rows where created_at is strictly less than the cursor timestamp,
+    // OR created_at equals the cursor AND id is lexicographically greater
+    // (since we want to exclude the cursor itself and get deterministic order).
     const { data, error } = await supabase
       .from('tx_log')
       .select('*')
-      .lt('created_at', cursor)
+      .or(
+        `created_at.lt.${cursor.created_at},and(created_at.eq.${cursor.created_at},id.gt.${cursor.id})`,
+      )
       .order('created_at', { ascending: false })
+      .order('id', { ascending: false })
       .limit(PAGE_SIZE)
 
     if (error) {
@@ -151,7 +164,11 @@ export function TxFeed({ initialEntries = [] }: TxFeedProps) {
 
     const rows = (data ?? []) as TxLogEntry[]
     if (rows.length > 0) {
-      cursorRef.current = rows[rows.length - 1].created_at
+      const lastRow = rows[rows.length - 1]
+      cursorRef.current = {
+        created_at: lastRow.created_at,
+        id: lastRow.id,
+      }
     }
     setHasMore(rows.length === PAGE_SIZE)
     setEntries((prev) => {
